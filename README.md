@@ -64,6 +64,8 @@ npm run dev
 | 家具配置 | `furniture` | 家具方案 | 家具类型、摆放位置、数量需求 |
 | 导视系统 | `signage` | 导视牌 | 指示内容、安装点位、尺寸规格 |
 | 验收清单 | `checklist` | 验收项 | 验收条目、验收标准、负责班组 |
+| 验收办理 | `acceptance_voucher` | 办理凭据 | 办理编号、检查编号、签收状态 |
+| 前置检查 | `prerequisite_check` | 检查记录 | 检查编号、检查类型、轮次、结论 |
 | 变更指令 | `change_order` | 变更单 | 变更内容、影响展位、施工班组 |
 | 布展排期 | `schedule` | 排期计划 | 活动名称、布展起始、撤展截止 |
 | 交场确认 | `handover` | 交场单 | 交出班组、接收人员、遗留事项 |
@@ -76,6 +78,26 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 同名进度节点按展位分别判断（DAG 校验、阻塞待办都只在同一展位内建图/比对）。
+
+## 施工待办与验收办理
+
+搭建进度的待办入口在 `/blocking-todos` 页面，也可直接调接口：
+
+- `GET /api/exhibition/construction/todos?blocked_by=电检&booth_no=BOOT-A01`
+  按阻塞源（前置节点 / 电检 / 安全巡检）筛选施工待办。
+- `GET /api/exhibition/checks/{检查编号}` 值班员按检查号回看该轮筛查结论，
+  已重开作废的旧轮次仍返回原结论。
+- `POST /api/exhibition/checklist/{验收项id}/voucher` 从进度节点 + 当前有效的
+  已通过电检签发办理凭据。
+- `POST /api/exhibition/vouchers/{办理编号}/submit` 提交签收（结果待回）。
+- `GET /api/exhibition/vouchers/{办理编号}` 重新打开原办理：能否完成、是否需补检查、
+  同一次签收的多份电检结论、以及其它展位同名节点是否变化。
+- `POST /api/exhibition/checklist/{验收项id}/credential-signoff` 用凭据/检查号签收；
+  已被重开的旧检查编号会被拦住。
+
+变更单签发时会重开受影响展位的电检前置检查（旧轮次留结论可查），
+并从旧结论签发的办理凭据一并作废；同一轮旧检查不能重复重开。
 
 领域：应用开发
 子方向：web前端/全栈开发

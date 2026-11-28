@@ -1,9 +1,9 @@
 """跨模块会展引擎路由：执行历史、进度推进、配额视图等集成接口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.services import exhibition
+from app.services import acceptance, exhibition
 
 exhibition_router = APIRouter(prefix="/api/exhibition", tags=["跨模块引擎"])
 
@@ -115,6 +115,143 @@ def dag_validate() -> dict:
 def safety_status(booth_no: str) -> dict:
     """展位安全巡检状态。"""
     return exhibition.check_safety_gate(booth_no)
+
+
+# ---------- 施工待办（按依赖阻塞定位） ----------
+
+@exhibition_router.get("/construction/todos")
+def construction_todos(
+    blocked_by: str | None = Query(default=None, description="阻塞源：前置节点 / 电检 / 安全巡检"),
+    booth_no: str | None = Query(default=None),
+    node_name: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
+) -> dict:
+    """施工待办：按依赖阻塞定位，可按阻塞源筛选；同名节点按展位分别判断。"""
+    return acceptance.construction_todos(
+        blocked_by=blocked_by, booth_no=booth_no, node_name=node_name, keyword=keyword
+    )
+
+
+@exhibition_router.get("/construction/todos/sources")
+def construction_todo_sources(booth_no: str | None = Query(default=None)) -> dict:
+    """施工待办可用阻塞源及各自命中数量。"""
+    return acceptance.todo_sources(booth_no=booth_no)
+
+
+# ---------- 前置检查 ----------
+
+@exhibition_router.get("/checks")
+def list_checks(
+    booth_no: str | None = Query(default=None),
+    node_name: str | None = Query(default=None),
+    check_type: str | None = Query(default=None),
+    include_superseded: bool = Query(default=False),
+) -> dict:
+    """前置检查列表：默认只返回未作废的当前轮次。"""
+    return acceptance.list_prerequisite_checks(
+        booth_no,
+        node_name=node_name,
+        check_type=check_type,
+        include_superseded=include_superseded,
+    )
+
+
+@exhibition_router.get("/checks/{check_no}")
+def get_check(check_no: str) -> dict:
+    """按检查号回看筛查结论：已作废的旧轮次仍返回当初结论。"""
+    result = acceptance.check_detail(check_no)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["reason"])
+    return result
+
+
+@exhibition_router.post("/checks/{check_no}/result")
+def record_check_result(check_no: str, payload: dict = Body(default={})) -> dict:
+    """录入某一轮前置检查结论（passed 决定是否可签发凭据）。"""
+    passed = bool(payload.get("passed", False))
+    result = acceptance.record_check_result(
+        check_no,
+        passed=passed,
+        conclusion=str(payload.get("conclusion", "")),
+        operator=str(payload.get("operator", "")),
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@exhibition_router.post("/checks/{check_no}/reopen")
+def reopen_check(check_no: str, payload: dict = Body(default={})) -> dict:
+    """重开前置检查：新开一轮待检，旧结论保留但旧凭据作废。"""
+    result = acceptance.reopen_prerequisite_check(
+        check_no,
+        reason=str(payload.get("reason", "")),
+        change_id=payload.get("change_id"),
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@exhibition_router.post("/checks/{check_no}/validate")
+def validate_check_credential(check_no: str, payload: dict = Body(default={})) -> dict:
+    """校验检查号能否作为办理凭据（旧轮次/未通过/不存在都会被拦住）。"""
+    return acceptance.validate_credential(
+        check_no,
+        booth_no=payload.get("booth_no"),
+        node_name=payload.get("node_name"),
+    )
+
+
+# ---------- 验收办理凭据 ----------
+
+@exhibition_router.post("/checklist/{checklist_id}/voucher")
+def issue_voucher(checklist_id: int, payload: dict = Body(default={})) -> dict:
+    """根据进度节点 + 当前有效的已通过前置检查签发验收办理凭据。"""
+    result = acceptance.issue_acceptance_voucher(
+        checklist_id,
+        node_id=payload.get("node_id"),
+        check_no=payload.get("check_no"),
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@exhibition_router.get("/vouchers/{voucher_no}")
+def get_voucher(voucher_no: str) -> dict:
+    """重新打开办理凭据：能否完成、是否需补检查、同名节点是否变化。"""
+    result = acceptance.get_acceptance_voucher(voucher_no)
+    if not result["ok"]:
+        raise HTTPException(status_code=404, detail=result["reason"])
+    return result
+
+
+@exhibition_router.post("/vouchers/{voucher_no}/submit")
+def submit_voucher(voucher_no: str, payload: dict = Body(default={})) -> dict:
+    """提交签收（尚未收到结果），提交前再校验一次办理凭据。"""
+    result = acceptance.submit_voucher_signoff(
+        voucher_no,
+        check_no=payload.get("check_no"),
+        remark=payload.get("remark"),
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
+
+
+@exhibition_router.post("/checklist/{checklist_id}/credential-signoff")
+def credential_signoff(checklist_id: int, payload: dict = Body(default={})) -> dict:
+    """用办理凭据/检查号签收；旧检查编号会被拦住。"""
+    result = acceptance.signoff_with_credential(
+        checklist_id,
+        check_no=payload.get("check_no"),
+        voucher_no=payload.get("voucher_no"),
+        node_id=payload.get("node_id"),
+    )
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["reason"])
+    return result
 
 
 # ---------- 跨模块关联查询路由 ----------

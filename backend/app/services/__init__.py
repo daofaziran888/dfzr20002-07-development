@@ -20,6 +20,8 @@ from app.services.change_order import ChangeOrderService
 from app.services.schedule import ScheduleService
 from app.services.handover import HandoverService
 from app.services.incident import IncidentService
+from app.services.prerequisite_check import PrerequisiteCheckService
+from app.services.acceptance_voucher import AcceptanceVoucherService
 
 SERVICES: dict[str, BaseModuleService] = {
     "venue": VenueService(),
@@ -40,6 +42,8 @@ SERVICES: dict[str, BaseModuleService] = {
     "schedule": ScheduleService(),
     "handover": HandoverService(),
     "incident": IncidentService(),
+    "prerequisite_check": PrerequisiteCheckService(),
+    "acceptance_voucher": AcceptanceVoucherService(),
 }
 
 

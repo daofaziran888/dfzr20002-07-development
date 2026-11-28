@@ -111,33 +111,61 @@ def check_electrical_quota(booth_no: str) -> dict[str, Any]:
 
 # ---------- DAG 拓扑推进 ----------
 
-def detect_cycle(nodes: list[dict[str, Any]]) -> list[str] | None:
-    """检测前置节点依赖图中是否存在环，有环返回环上节点名称列表。"""
-    name_to_id: dict[str, int] = {}
+def node_booth(node: dict[str, Any]) -> str:
+    """取进度节点所属展位编号。
+
+    备注说明里可能带补充说明（如 "BOOT-B01 晚于布展 有冲突风险"），
+    取第一个空白分隔的片段作为展位身份，保证两个展位的同名节点分别归属。
+    """
+    remark = str(node.get("备注说明", "")).strip()
+    return remark.split()[0] if remark else ""
+
+
+def booth_nodes(nodes: list[dict[str, Any]], booth_no: str | None) -> list[dict[str, Any]]:
+    """按展位筛选进度节点；booth_no 为空时返回全量。"""
+    if not booth_no:
+        return list(nodes)
+    return [node for node in nodes if node_booth(node) == booth_no]
+
+
+def unique_nodes_by_name(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """同名节点只保留第一条。
+
+    跨展位汇总视图（拓扑排序/环检测）不应把两个展位的同名节点当成同一个
+    节点连接，否则 A01 的前置关系会被错误地接到 A02 上。
+    """
+    unique: dict[str, dict[str, Any]] = {}
     for node in nodes:
-        name = str(node.get("节点名称", ""))
-        if name:
-            name_to_id[name] = int(node.get("id", 0))
+        name = str(node.get("节点名称", "")).strip()
+        if name and name not in unique:
+            unique[name] = node
+    return unique
+
+
+def detect_cycle(
+    nodes: list[dict[str, Any]], booth_no: str | None = None
+) -> list[str] | None:
+    """检测前置节点依赖图中是否存在环，有环返回环上节点名称列表。
+
+    booth_no 不为空时只在同一展位内建图；为空时按同名节点去重后建图，
+    保持跨展位汇总视图的原有拓扑顺序。
+    """
+    unique = unique_nodes_by_name(booth_nodes(nodes, booth_no))
 
     graph: dict[str, list[str]] = {}
-    for node in nodes:
-        name = str(node.get("节点名称", ""))
-        if not name:
-            continue
+    for name, node in unique.items():
         pred_text = str(node.get("前置节点", "")).strip()
         preds = [p.strip() for p in pred_text.split(",") if p.strip()]
         graph[name] = preds
 
     WHITE, GRAY, BLACK = 0, 1, 2
     color: dict[str, int] = {name: WHITE for name in graph}
-    parent: dict[str, str | None] = {name: None for name in graph}
 
     def dfs(u: str) -> bool:
         color[u] = GRAY
         for v in graph.get(u, []):
             if v not in color:
                 color[v] = WHITE
-                parent[v] = u
                 if dfs(v):
                     return True
             elif color.get(v) == GRAY:
@@ -148,25 +176,19 @@ def detect_cycle(nodes: list[dict[str, Any]]) -> list[str] | None:
     for node_name in graph:
         if color.get(node_name) == WHITE:
             if dfs(node_name):
-                # Find cycle by traversing back
                 return [node_name]
     return None
 
 
-def build_dag_order(nodes: list[dict[str, Any]]) -> list[str]:
-    """返回拓扑排序后的节点名称列表。"""
-    name_to_node: dict[str, dict[str, Any]] = {}
-    for node in nodes:
-        name = str(node.get("节点名称", ""))
-        if name:
-            name_to_node[name] = node
+def build_dag_order(
+    nodes: list[dict[str, Any]], booth_no: str | None = None
+) -> list[str]:
+    """返回拓扑排序后的节点名称列表（同名节点跨展位去重）。"""
+    unique = unique_nodes_by_name(booth_nodes(nodes, booth_no))
 
     pred_counts: dict[str, int] = {}
     successors: dict[str, list[str]] = {}
-    for node in nodes:
-        name = str(node.get("节点名称", ""))
-        if not name:
-            continue
+    for name, node in unique.items():
         pred_text = str(node.get("前置节点", "")).strip()
         preds = [p.strip() for p in pred_text.split(",") if p.strip()]
         pred_counts[name] = len(preds)
@@ -174,7 +196,7 @@ def build_dag_order(nodes: list[dict[str, Any]]) -> list[str]:
             successors.setdefault(pred, []).append(name)
 
     queue: deque[str] = deque()
-    for name in name_to_node:
+    for name in unique:
         if pred_counts.get(name, 0) == 0:
             queue.append(name)
 
@@ -191,28 +213,31 @@ def build_dag_order(nodes: list[dict[str, Any]]) -> list[str]:
 
 
 def validate_dag_advance(node_id: int) -> dict[str, Any]:
-    """检查进度节点是否可以推进（所有前置节点必须已完成）。"""
+    """检查进度节点是否可以推进（同展位内所有前置节点必须已完成）。"""
     node = store.find("construction", node_id)
     if node is None:
         return {"ok": False, "reason": f"进度节点 {node_id} 不存在"}
 
     all_nodes = store.rows("construction")
-    dag_order = build_dag_order(all_nodes)
+    booth_no = node_booth(node)
+    # 只在同一展位内取节点：两个展位可能有同名节点，不能混在一起判断。
+    scoped_nodes = booth_nodes(all_nodes, booth_no)
+    dag_order = build_dag_order(all_nodes, booth_no)
 
     node_name = str(node.get("节点名称", ""))
     pred_text = str(node.get("前置节点", "")).strip()
     preds = [p.strip() for p in pred_text.split(",") if p.strip()]
 
     # 检测环
-    cycle = detect_cycle(all_nodes)
+    cycle = detect_cycle(all_nodes, booth_no)
     if cycle:
-        return {"ok": False, "reason": f"前置依赖存在环：{cycle}", "cycle": cycle}
+        return {"ok": False, "reason": f"前置依赖存在环：{cycle}", "cycle": cycle, "booth_no": booth_no}
 
     # 检查每个前置节点是否已确认
     unfinished_preds: list[str] = []
     for pred_name in preds:
         pred_node = None
-        for n in all_nodes:
+        for n in scoped_nodes:
             if str(n.get("节点名称", "")) == pred_name:
                 pred_node = n
                 break
@@ -224,12 +249,14 @@ def validate_dag_advance(node_id: int) -> dict[str, Any]:
             "ok": False,
             "reason": f"前置节点未完成：{'、'.join(unfinished_preds)}，不能跳过前置节点",
             "unfinished_predecessors": unfinished_preds,
+            "booth_no": booth_no,
         }
 
     return {
         "ok": True,
         "reason": "前置条件已满足",
         "node": node_name,
+        "booth_no": booth_no,
         "predecessors": preds,
         "dag_order": dag_order,
     }
@@ -363,15 +390,24 @@ def do_handover(handover_id: int) -> dict[str, Any]:
 # ---------- 变更传播与回退 ----------
 
 def propagate_change_order(change_id: int) -> dict[str, Any]:
-    """签发变更指令后，受影响展位的进度节点回到'待确认'并需要重新验收。"""
+    """签发变更指令后，受影响展位的进度节点回到'待确认'并需要重新验收。
+
+    除进度节点和验收项回退外，还会重开受影响展位的电检前置检查：
+    旧轮次结论保留可查，但从旧结论签发的办理凭据一并作废。
+    """
     change = store.find("change_order", change_id)
     if change is None:
         return {"ok": False, "reason": f"变更单 {change_id} 不存在"}
+
+    # 延迟导入，避免 acceptance 与 exhibition 循环引用。
+    from app.services import acceptance
 
     booth_no_list = str(change.get("影响展位", "")).split(",")
     booth_no_list = [b.strip() for b in booth_no_list if b.strip()]
     affected_nodes: list[dict[str, Any]] = []
     affected_checklists: list[dict[str, Any]] = []
+    reopened_checks: list[dict[str, Any]] = []
+    invalidated_vouchers: list[dict[str, Any]] = []
 
     for booth_no in booth_no_list:
         # 回退进度节点
@@ -393,6 +429,16 @@ def propagate_change_order(change_id: int) -> dict[str, Any]:
                 item["abnormal"] = True
                 affected_checklists.append({"id": item.get("id"), "item": item.get("验收条目", "")})
 
+        # 重开电检前置检查：旧结论作废，已签发凭据失效。
+        reopen_result = acceptance.reopen_checks_for_booth(
+            booth_no,
+            check_type="电检",
+            reason=f"变更单 {change.get('登记编号', change_id)} 重开电检",
+            change_id=change_id,
+        )
+        reopened_checks.extend(reopen_result["reopened_checks"])
+        invalidated_vouchers.extend(reopen_result["invalidated_vouchers"])
+
     before_state = copy.deepcopy(change)
     change["status"] = "已确认"
     change["pending"] = False
@@ -407,16 +453,23 @@ def propagate_change_order(change_id: int) -> dict[str, Any]:
             "affected_booths": booth_no_list,
             "reverted_nodes": len(affected_nodes),
             "reverted_checklists": len(affected_checklists),
+            "reopened_checks": len(reopened_checks),
+            "invalidated_vouchers": len(invalidated_vouchers),
         },
     )
     store.rebuild_indices()
 
     return {
         "ok": True,
-        "reason": f"变更已签发，{len(affected_nodes)} 个进度节点和 {len(affected_checklists)} 条验收项已回退",
+        "reason": (
+            f"变更已签发，{len(affected_nodes)} 个进度节点和 {len(affected_checklists)} 条验收项已回退，"
+            f"{len(reopened_checks)} 项前置检查已重开，{len(invalidated_vouchers)} 张办理凭据已作废"
+        ),
         "affected_booths": booth_no_list,
         "affected_nodes": affected_nodes,
         "affected_checklists": affected_checklists,
+        "reopened_checks": reopened_checks,
+        "invalidated_vouchers": invalidated_vouchers,
     }
 
 
